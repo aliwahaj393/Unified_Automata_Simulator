@@ -1,0 +1,1690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Turing Machine Simulator</title>
+<script src="https://cdn.jsdelivr.net/npm/neo4j-driver@5/lib/browser/neo4j-web.min.js"></script>
+<script>
+// ════════════════════════════════════════════════════════
+//  NEO4J OPERATIONS  (must be before DOMContentLoaded)
+// ════════════════════════════════════════════════════════
+let globalDriver=null, savedTMs=[];
+function v(id){return document.getElementById(id)?.value||'';}
+
+function toggleConnPanel(){
+  document.getElementById('conn-panel-toggle').classList.toggle('open');
+  document.getElementById('conn-fields').classList.toggle('open');
+}
+
+async function neoConnect(){
+  const uri=v('neo4j-uri'),user=v('neo4j-user'),pass=v('neo4j-pass'),db=v('neo4j-db');
+  const btn=document.getElementById('btn-connect');
+  btn.textContent='…';btn.disabled=true;
+  if(globalDriver){try{await globalDriver.close();}catch(_){}globalDriver=null;}
+  try{
+    globalDriver=neo4j.driver(uri,neo4j.auth.basic(user,pass));
+    await globalDriver.verifyConnectivity();
+  }catch(e){
+    setBadge('err','Neo4j: '+e.message.split('\n')[0]);
+    setBar('Connection failed: '+e.message);
+    globalDriver=null;btn.textContent='⚡ CONNECT';btn.disabled=false;return;
+  }
+  try{
+    const ses=globalDriver.session({database:db});
+    const res=await ses.run('MATCH (t:TM) RETURN t.id AS id,t.name AS name,t.desc AS desc ORDER BY t.name');
+    await ses.close();
+    savedTMs=res.records.map(r=>({id:r.get('id'),name:r.get('name'),desc:r.get('desc')||''}));
+    const dd=document.getElementById('tm-dropdown');
+    dd.innerHTML='<option value="">-- select saved TM --</option>';
+    savedTMs.forEach(t=>{const o=document.createElement('option');o.value=t.id;o.textContent=t.name+' ['+t.id+']';dd.appendChild(o);});
+    document.getElementById('tm-select-sec').classList.add('visible');
+    document.getElementById('btn-load-tm').disabled=true;
+    document.getElementById('btn-delete-tm').disabled=true;
+    setBadge('ok','Neo4j connected — '+savedTMs.length+' TM(s)');
+    setBar('Connected. Found '+savedTMs.length+' saved TM(s).');
+    const tog=document.getElementById('conn-panel-toggle'),fld=document.getElementById('conn-fields');
+    if(tog.classList.contains('open')){tog.classList.remove('open');fld.classList.remove('open');}
+  }catch(e){setBadge('err','Query error');setBar('Error: '+e.message);}
+  btn.textContent='⚡ CONNECT';btn.disabled=false;
+}
+
+function onTmDropdownChange(){
+  const id=v('tm-dropdown'),info=document.getElementById('tm-db-info');
+  const btnL=document.getElementById('btn-load-tm'),btnD=document.getElementById('btn-delete-tm');
+  if(!id){btnL.disabled=true;btnD.disabled=true;info.classList.remove('visible');return;}
+  const f=savedTMs.find(t=>t.id===id);
+  if(f){info.innerHTML='<span>'+escH(f.name)+'</span><br><div style="margin-top:3px;font-size:10px">'+escH(f.desc||'No description')+'</div>';info.classList.add('visible');}
+  btnL.disabled=false;btnD.disabled=false;
+}
+
+async function saveTMtoNeo4j(){
+  if(!tm||!globalDriver){toast('Build a machine and connect to Neo4j first','err');return;}
+  const name=(tm.name||'Custom TM').trim();
+  const id='tm_'+name.replace(/[^a-zA-Z0-9]/g,'_').toLowerCase()+'_'+Date.now();
+  const desc='TM | States:'+tm.states.length+' | Γ:{'+tm.tapeAlpha.join(',')+'}';
+  const db=v('neo4j-db');
+  const btn=document.getElementById('btn-save-neo4j');btn.textContent='…';btn.disabled=true;
+  try{
+    const ses=globalDriver.session({database:db});
+    await ses.run(
+      'CREATE (:TM {id:$id,name:$name,desc:$desc,startState:$s,acceptState:$a,rejectState:$r,tapeAlpha:$ta,blank:$b})',
+      {id,name,desc,s:tm.start,a:tm.accept,r:tm.reject||'',ta:tm.tapeAlpha.join(','),b:tm.blank}
+    );
+    for(const s of tm.states){
+      await ses.run('CREATE (:TMState {name:$sn,tmId:$id,isStart:$is,isAccept:$ia,isReject:$ir})',
+        {sn:id+'_'+s,id,is:s===tm.start,ia:s===tm.accept,ir:s===tm.reject});
+      await ses.run('MATCH (t:TM {id:$id}),(s:TMState {name:$sn}) CREATE (t)-[:HAS_STATE]->(s)',{id,sn:id+'_'+s});
+    }
+    for(const t of tm.trans){
+      await ses.run(
+        'MATCH (f:TMState {name:$fn}),(to:TMState {name:$tn}) CREATE (f)-[:TM_TRANSITION {read:$r,write:$w,direction:$d}]->(to)',
+        {fn:id+'_'+t.from,tn:id+'_'+t.to,r:t.read,w:t.write,d:t.dir}
+      );
+    }
+    await ses.close();
+    savedTMs.push({id,name,desc});
+    const dd=document.getElementById('tm-dropdown');
+    const opt=document.createElement('option');opt.value=id;opt.textContent=name+' ['+id+']';dd.appendChild(opt);
+    toast('Saved to Neo4j: '+name,'ok');
+    setBar('TM "'+name+'" saved to Neo4j (id: '+id+').');
+  }catch(e){toast('Neo4j save error: '+e.message.split('\n')[0],'err');}
+  btn.textContent='☁ Save';btn.disabled=false;
+}
+
+async function loadSavedTM(){
+  const id=v('tm-dropdown');
+  if(!id||!globalDriver){toast('Select a TM and connect first','err');return;}
+  const db=v('neo4j-db');
+  const btn=document.getElementById('btn-load-tm');btn.textContent='…';btn.disabled=true;
+  try{
+    const ses=globalDriver.session({database:db});
+    const pr=await ses.run('MATCH (t:TM {id:$id}) RETURN t',{id});
+    if(!pr.records.length){toast('TM not found','err');btn.textContent='▶ LOAD';btn.disabled=false;return;}
+    const props=pr.records[0].get('t').properties;
+    const sr=await ses.run('MATCH (t:TM {id:$id})-[:HAS_STATE]->(s:TMState) RETURN s ORDER BY s.name',{id});
+    const states=sr.records.map(r=>r.get('s').properties.name.replace(id+'_',''));
+    const tr=await ses.run(
+      'MATCH (t:TM {id:$id})-[:HAS_STATE]->(f:TMState)-[r:TM_TRANSITION]->(to:TMState) RETURN f.name AS fn,r.read AS rd,r.write AS wr,r.direction AS d,to.name AS tn',{id}
+    );
+    const trans=tr.records.map(r=>({from:r.get('fn').replace(id+'_',''),read:r.get('rd'),write:r.get('wr'),dir:r.get('d'),to:r.get('tn').replace(id+'_','')}));
+    await ses.close();
+    tm={name:props.name,states,start:props.startState,accept:props.acceptState,reject:props.rejectState||null,
+      tapeAlpha:(props.tapeAlpha||'').split(',').filter(Boolean),blank:props.blank||BLANK,trans};
+    onTMApplied();toast('Loaded: '+props.name,'ok');
+  }catch(e){toast('Load error: '+e.message.split('\n')[0],'err');}
+  btn.textContent='▶ LOAD';btn.disabled=false;
+}
+
+async function deleteSavedTM(){
+  const id=v('tm-dropdown');
+  if(!id||!globalDriver){toast('Select a TM first','err');return;}
+  if(!confirm('Delete this TM from Neo4j? This cannot be undone.'))return;
+  const db=v('neo4j-db');
+  try{
+    const ses=globalDriver.session({database:db});
+    await ses.run('MATCH (t:TM {id:$id})-[:HAS_STATE]->(s:TMState) DETACH DELETE s',{id});
+    await ses.run('MATCH (t:TM {id:$id}) DETACH DELETE t',{id});
+    await ses.close();
+    savedTMs=savedTMs.filter(t=>t.id!==id);
+    const dd=document.getElementById('tm-dropdown');
+    const opt=[...dd.options].find(o=>o.value===id);if(opt)dd.removeChild(opt);
+    dd.value='';onTmDropdownChange();
+    document.getElementById('tm-db-info').classList.remove('visible');
+    toast('TM deleted from Neo4j','ok');setBar('TM deleted.');
+  }catch(e){toast('Delete error: '+e.message.split('\n')[0],'err');}
+}
+</script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ─── RESET & ROOT ────────────────────────────────────── */
+*{margin:0;padding:0;box-sizing:border-box;}
+:root{
+  --bg:#0f172a;--surface:#1e293b;--card:#334155;--border:#475569;
+  --accent:#818cf8;--accent-hover:#6366f1;
+  --green:#10b981;--red:#ef4444;--yellow:#f59e0b;--purple:#a78bfa;--cyan:#22d3ee;
+  --text:#f8fafc;--muted:#94a3b8;
+  --font-ui:'Inter',sans-serif;--font-mono:'JetBrains Mono',monospace;
+}
+:root.light{
+  --bg:#f1f5f9;--surface:#ffffff;--card:#e2e8f0;--border:#cbd5e1;
+  --accent:#4f46e5;--accent-hover:#4338ca;
+  --green:#059669;--red:#dc2626;--yellow:#d97706;--purple:#7c3aed;--cyan:#0891b2;
+  --text:#0f172a;--muted:#64748b;
+}
+:root.light #svg-canvas{background:#f8fafc;}
+:root.light .canvas-area{background:#f8fafc;}
+
+/* ─── BASE ────────────────────────────────────────────── */
+body{background:var(--bg);color:var(--text);font-family:var(--font-ui);height:100vh;display:flex;flex-direction:column;overflow:hidden;}
+
+/* ─── HEADER ─────────────────────────────────────────── */
+header{display:flex;align-items:center;gap:12px;padding:14px 24px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;box-shadow:0 4px 12px rgba(0,0,0,.12);z-index:20;}
+header h1{font-family:var(--font-mono);font-size:15px;font-weight:700;letter-spacing:3px;color:var(--accent);}
+.hdr-sep{color:var(--border);}
+.hdr-sub{font-size:13px;color:var(--muted);font-weight:500;}
+.hdr-badge{margin-left:auto;font-size:12px;display:flex;align-items:center;gap:8px;font-weight:600;background:var(--bg);padding:6px 14px;border-radius:20px;border:1px solid var(--border);}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;}
+.dot-green{background:var(--green);box-shadow:0 0 8px var(--green);}
+.dot-yellow{background:var(--yellow);animation:blink 1.1s infinite;}
+.dot-red{background:var(--red);}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
+.theme-btn{margin-left:8px;background:transparent;border:1px solid var(--border);color:var(--muted);padding:6px 12px;border-radius:6px;font-family:var(--font-ui);font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer;transition:all .2s;}
+.theme-btn:hover{border-color:var(--accent);color:var(--accent);}
+
+/* ─── LAYOUT ──────────────────────────────────────────── */
+.main{display:flex;flex:1;overflow:hidden;}
+
+/* ─── SIDEBAR ─────────────────────────────────────────── */
+.sidebar{width:304px;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0;z-index:10;box-shadow:4px 0 16px rgba(0,0,0,.1);}
+.sidebar::-webkit-scrollbar{width:5px;}
+.sidebar::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px;}
+.sec{padding:15px 17px;border-bottom:1px solid var(--border);}
+.sec-title{font-size:9px;letter-spacing:2.5px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:12px;}
+label{display:block;font-size:12px;font-weight:500;color:var(--text);margin-bottom:5px;}
+input[type=text],input[type=password],input[type=number],select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--font-mono);font-size:12px;padding:8px 10px;border-radius:6px;margin-bottom:9px;outline:none;transition:all .18s;appearance:none;}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(129,140,248,.18);}
+select option{background:var(--card);}
+input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;}
+input[type=number]{-moz-appearance:textfield;}
+
+/* ─── BUTTONS ─────────────────────────────────────────── */
+button{font-family:var(--font-ui);font-size:12px;font-weight:600;letter-spacing:.4px;padding:9px 14px;border:none;border-radius:6px;cursor:pointer;transition:all .18s;}
+.btn-primary{width:100%;background:var(--accent);color:#fff;margin-bottom:8px;}
+.btn-primary:hover{background:var(--accent-hover);transform:translateY(-1px);}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.btn-row{display:flex;gap:7px;margin-bottom:6px;}
+.btn-ghost{flex:1;background:transparent;border:1px solid var(--border);color:var(--text);}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent);background:rgba(129,140,248,.08);}
+.btn-ghost:disabled{opacity:.38;cursor:not-allowed;}
+.btn-run{flex:1;background:var(--green);color:#fff;}
+.btn-run:hover{background:#059669;transform:translateY(-1px);}
+.btn-run:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.btn-danger{background:transparent;border:1px solid var(--border);color:var(--muted);width:100%;margin-bottom:6px;}
+.btn-danger:hover{border-color:var(--red);color:var(--red);background:rgba(239,68,68,.07);}
+.io-row{display:none;gap:6px;margin-bottom:8px;}
+.io-btn{flex:1;background:transparent;border:1px solid var(--border);color:var(--muted);font-size:11px;padding:6px 4px;border-radius:5px;cursor:pointer;transition:all .18s;}
+.io-btn:hover{border-color:var(--accent);color:var(--accent);background:rgba(129,140,248,.08);}
+
+/* ─── NEO4J PANEL ─────────────────────────────────────── */
+.conn-toggle-btn{width:100%;background:transparent;border:none;display:flex;align-items:center;justify-content:space-between;color:var(--muted);cursor:pointer;padding:0;margin-bottom:0;letter-spacing:2px;font-size:9px;font-weight:700;text-transform:uppercase;transition:color .15s;}
+.conn-toggle-btn:hover{color:var(--accent);}
+.conn-caret{transition:transform .22s;font-size:10px;flex-shrink:0;}
+.conn-toggle-btn.open .conn-caret{transform:rotate(180deg);}
+.conn-fields{max-height:0;overflow:hidden;transition:max-height .3s;}
+.conn-fields.open{max-height:360px;padding-top:12px;}
+.pda-select-sec{display:none;}
+.pda-select-sec.visible{display:block;}
+.pda-db-info{display:none;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:11px;color:var(--muted);line-height:1.6;}
+.pda-db-info.visible{display:block;}
+.pda-db-info span{color:var(--accent);font-weight:600;}
+
+/* ─── TM CARD ─────────────────────────────────────────── */
+.tm-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 13px;margin-bottom:2px;font-size:11px;color:var(--muted);min-height:40px;line-height:1.75;}
+.tm-card span{color:var(--accent);font-weight:700;font-size:12px;}
+.tm-trans-list{max-height:120px;overflow-y:auto;font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:6px;}
+.tm-trans-list::-webkit-scrollbar{width:3px;}
+.tm-trans-list::-webkit-scrollbar-thumb{background:var(--border);}
+.ttr{padding:2px 0;border-bottom:1px solid rgba(71,85,105,.2);display:flex;gap:5px;}
+.ttr-from{color:var(--accent);font-weight:700;}
+.ttr-read{color:var(--yellow);font-weight:700;}
+.ttr-write{color:var(--cyan);font-weight:700;}
+.ttr-dir{color:var(--purple);font-weight:700;}
+.ttr-to{color:var(--green);font-weight:700;}
+
+/* ─── STATE PILLS ──────────────────────────────────────── */
+.state-pills{display:flex;flex-direction:column;gap:5px;}
+.state-pill{display:flex;align-items:center;gap:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;transition:all .18s;}
+.state-pill.sp-active{border-color:var(--yellow);background:rgba(245,158,11,.07);box-shadow:0 0 0 1px rgba(245,158,11,.2);}
+.sp-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.sp-name{font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text);flex:1;}
+.sp-badges{display:flex;gap:3px;flex-wrap:wrap;}
+.sp-badge{font-size:7px;font-weight:700;letter-spacing:.3px;padding:1px 5px;border-radius:2px;}
+.sp-badge.start{background:var(--accent);color:#fff;}
+.sp-badge.accept{background:var(--green);color:#fff;}
+.sp-badge.reject{background:var(--red);color:#fff;}
+
+/* ─── TRACE ───────────────────────────────────────────── */
+.trace-scroll{max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;background:var(--bg);padding:8px 10px;border-radius:6px;border:1px solid var(--border);}
+.trace-scroll::-webkit-scrollbar{width:4px;}
+.trace-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+.trace-line{font-size:10px;font-family:var(--font-mono);display:flex;align-items:center;gap:5px;color:var(--muted);flex-wrap:wrap;line-height:1.5;}
+.tl-step{color:var(--border);font-size:9px;min-width:22px;}
+.tl-state{color:var(--accent);font-weight:700;}
+.tl-sym{color:var(--yellow);font-weight:700;background:rgba(245,158,11,.1);padding:0px 5px;border-radius:3px;}
+.tl-write{color:var(--cyan);font-weight:700;background:rgba(34,211,238,.1);padding:0px 5px;border-radius:3px;}
+.tl-dir{color:var(--purple);font-weight:700;min-width:14px;}
+.tl-rule{color:var(--muted);font-style:italic;font-size:9px;}
+.tl-accept{color:var(--green);font-weight:700;}
+.tl-reject{color:var(--red);font-weight:700;}
+.tl-warn{color:var(--yellow);font-weight:700;}
+.result-box{margin-top:10px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:700;letter-spacing:.8px;text-align:center;}
+.res-accept{background:rgba(16,185,129,.1);border:1px solid var(--green);color:var(--green);}
+.res-reject{background:rgba(239,68,68,.1);border:1px solid var(--red);color:var(--red);}
+.res-sub{font-size:10px;font-weight:400;margin-top:4px;letter-spacing:0;}
+
+/* ─── LEGEND ──────────────────────────────────────────── */
+.legend{display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--muted);}
+.li{display:flex;align-items:center;gap:8px;}
+.lc{width:16px;height:16px;border-radius:50%;border:2px solid currentColor;background:transparent;flex-shrink:0;}
+
+/* ─── CANVAS AREA ─────────────────────────────────────── */
+.canvas-area{flex:1;position:relative;background:var(--bg);overflow:hidden;}
+.canvas-bar{position:absolute;top:0;left:0;right:0;height:42px;z-index:15;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px;font-size:12px;}
+#bar-text{color:var(--muted);flex:1;font-size:12px;}
+.canvas-tag{background:var(--accent);color:#fff;font-size:8px;font-weight:700;letter-spacing:1px;padding:2px 6px;border-radius:3px;}
+.canvas-hint{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;z-index:5;}
+.canvas-hint h2{font-family:var(--font-mono);font-size:30px;font-weight:700;color:var(--border);letter-spacing:5px;}
+.canvas-hint p{color:var(--muted);margin-top:10px;font-size:14px;}
+#svg-canvas{position:absolute;top:42px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 42px);cursor:grab;}
+
+/* ─── VIEW TOGGLE ─────────────────────────────────────── */
+.view-toggle{display:none;gap:0;border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0;}
+.view-btn{background:transparent;border:none;color:var(--muted);font-size:10px;font-weight:600;padding:5px 11px;cursor:pointer;border-radius:0;letter-spacing:.4px;font-family:var(--font-ui);transition:all .15s;}
+.view-btn.active{background:var(--accent);color:#fff;}
+.view-btn:hover:not(.active){color:var(--text);background:rgba(129,140,248,.1);}
+
+/* ─── FLOATING TAPE ───────────────────────────────────── */
+.canvas-tape{position:absolute;bottom:58px;left:50%;transform:translateX(-50%);z-index:8;background:var(--surface);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:12px;padding:7px 14px 6px;flex-direction:column;align-items:center;gap:3px;box-shadow:0 8px 28px rgba(0,0,0,.35);}
+.canvas-tape.visible{display:flex!important;}
+.ct-label{font-size:8px;letter-spacing:2px;color:var(--muted);font-weight:700;text-transform:uppercase;align-self:flex-start;margin-bottom:1px;}
+.tape-track{display:flex;align-items:flex-start;gap:2px;}
+.tape-ellipsis{font-size:14px;color:var(--border);padding:0 3px;margin-top:14px;line-height:1;}
+.tape-cell{display:flex;flex-direction:column;align-items:center;flex-shrink:0;}
+.tape-ptr{font-size:10px;color:var(--yellow);height:14px;display:flex;align-items:center;justify-content:center;visibility:hidden;font-weight:700;}
+.tape-cell.tape-head .tape-ptr{visibility:visible;}
+.tape-sym{width:32px;height:32px;display:flex;align-items:center;justify-content:center;border:1.5px solid var(--border);background:var(--bg);border-radius:5px;font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--muted);transition:all .18s;}
+.tape-cell.tape-head .tape-sym{border-color:var(--yellow);color:var(--yellow);background:rgba(245,158,11,.14);transform:translateY(-2px);box-shadow:0 4px 10px rgba(245,158,11,.28);}
+.tape-cell.tape-written .tape-sym{color:var(--cyan);border-color:rgba(34,211,238,.4);background:rgba(34,211,238,.06);}
+.tape-cell.tape-blank .tape-sym{opacity:.26;}
+.tape-idx{font-size:7px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;opacity:.7;}
+
+/* ─── CONFIG DISPLAY ──────────────────────────────────── */
+.config-display{position:absolute;top:52px;right:14px;z-index:8;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px;display:none;min-width:138px;box-shadow:0 4px 16px rgba(0,0,0,.2);}
+.cfg-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px solid rgba(71,85,105,.3);}
+.cfg-row:last-child{border-bottom:none;}
+.cfg-lbl{font-size:8px;font-weight:700;letter-spacing:2px;color:var(--muted);}
+.cfg-val{font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--accent);}
+
+/* ─── SPACE-TIME CONTAINER ────────────────────────────── */
+#st-container{position:absolute;top:42px;left:0;right:0;bottom:0;overflow:auto;padding:18px 20px;display:none;background:var(--bg);}
+#st-canvas{display:block;border:1px solid var(--border);border-radius:6px;}
+.st-legend{display:flex;gap:14px;margin-bottom:10px;font-size:11px;color:var(--muted);align-items:center;}
+.stl-item{display:flex;align-items:center;gap:5px;}
+.stl-dot{width:12px;height:12px;border-radius:3px;flex-shrink:0;}
+.st-title{font-family:var(--font-mono);font-size:11px;color:var(--accent);letter-spacing:2px;font-weight:700;margin-bottom:8px;}
+
+/* ─── FLOATING CONTROLS ───────────────────────────────── */
+.floating-controls{position:absolute;bottom:10px;right:14px;z-index:8;display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.2);}
+.floating-controls button{padding:6px 10px;border-radius:5px;border:none;background:transparent;color:var(--muted);font-size:14px;cursor:pointer;transition:all .15s;}
+.floating-controls button:hover{background:var(--card);color:var(--text);}
+.fit-btn{font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:1px;}
+
+/* ─── MODAL ───────────────────────────────────────────── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .22s;}
+.modal-overlay.open{opacity:1;pointer-events:all;}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;width:min(960px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 40px 90px rgba(0,0,0,.55);}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:18px 24px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.modal-header h2{font-family:var(--font-mono);font-size:13px;font-weight:700;letter-spacing:2.5px;color:var(--accent);}
+.modal-close{background:transparent;border:1px solid var(--border);color:var(--muted);width:32px;height:32px;border-radius:6px;font-size:14px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+.modal-close:hover{border-color:var(--red);color:var(--red);}
+.modal-body{padding:20px 24px;overflow-y:auto;display:flex;flex-direction:column;gap:22px;flex:1;}
+.modal-body::-webkit-scrollbar{width:6px;}
+.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px;}
+.modal-sec-title{font-size:9px;letter-spacing:2.5px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:12px;padding-bottom:7px;border-bottom:1px solid var(--border);}
+.modal-footer{padding:16px 24px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;}
+.modal-msg{font-size:11px;flex:1;}
+.modal-msg.err{color:var(--red);}
+.modal-msg.ok{color:var(--green);}
+.btn-modal-cancel{background:transparent;border:1px solid var(--border);color:var(--muted);padding:9px 20px;cursor:pointer;}
+.btn-modal-cancel:hover{border-color:var(--text);color:var(--text);}
+.btn-modal-save{background:var(--accent);color:#fff;padding:9px 26px;cursor:pointer;}
+.btn-modal-save:hover{background:var(--accent-hover);}
+
+/* ─── PRESET GRID ─────────────────────────────────────── */
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:8px;}
+.preset-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 13px;cursor:pointer;transition:all .15s;}
+.preset-item:hover{border-color:var(--accent);background:rgba(129,140,248,.07);}
+.preset-item.selected{border-color:var(--accent);background:rgba(129,140,248,.14);}
+.pi-name{font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text);margin-bottom:3px;}
+.pi-lang{font-size:10px;color:var(--muted);}
+
+/* ─── MODAL ALPHA PILLS ───────────────────────────────── */
+.alpha-pills{display:flex;flex-wrap:wrap;gap:6px;min-height:32px;margin-bottom:4px;}
+.alpha-pill{display:flex;align-items:center;gap:6px;border-radius:20px;padding:4px 12px;font-family:var(--font-mono);font-size:12px;font-weight:700;border:1.5px solid;}
+.alpha-pill button{background:none;border:none;cursor:pointer;font-size:13px;color:inherit;opacity:.6;padding:0;line-height:1;font-family:var(--font-ui);}
+.alpha-pill button:hover{opacity:1;}
+.state-p{border-color:var(--accent);color:var(--accent);background:rgba(129,140,248,.07);}
+.accept-p{border-color:var(--green);color:var(--green);background:rgba(16,185,129,.07);}
+.reject-p{border-color:var(--red);color:var(--red);background:rgba(239,68,68,.07);}
+.sym-p{border-color:var(--purple);color:var(--purple);background:rgba(167,139,250,.07);}
+.blank-p{border-color:var(--border);color:var(--muted);background:rgba(71,85,105,.07);opacity:.8;}
+.start-badge{font-family:var(--font-ui);font-size:7px;border-radius:2px;padding:1px 5px;font-weight:700;letter-spacing:.3px;margin-left:2px;}
+.form-group{display:flex;flex-direction:column;}
+.qset{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}
+.qs-btn{background:var(--bg);border:1px solid var(--border);color:var(--muted);font-family:var(--font-mono);font-size:11px;padding:4px 11px;border-radius:4px;cursor:pointer;transition:all .15s;}
+.qs-btn:hover{border-color:var(--accent);color:var(--accent);}
+
+/* ─── TRANSITION TABLE ────────────────────────────────── */
+.tm-table-wrap{max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;}
+.tm-table-wrap::-webkit-scrollbar{width:4px;}
+.tm-table-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+.tm-table{width:100%;border-collapse:collapse;font-size:11px;}
+.tm-table th{font-size:8px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding:8px 10px;background:var(--card);font-family:var(--font-ui);font-weight:700;position:sticky;top:0;text-align:left;white-space:nowrap;}
+.tm-table td{padding:7px 10px;border-top:1px solid var(--border);font-family:var(--font-mono);}
+.tm-table tbody tr:hover td{background:rgba(129,140,248,.05);}
+.td-state{color:var(--accent);font-weight:700;}
+.td-sym{color:var(--yellow);font-weight:700;}
+.td-arrow{color:var(--muted);}
+.td-write{color:var(--cyan);font-weight:700;}
+.td-dir{color:var(--purple);font-weight:700;}
+.td-to{color:var(--green);font-weight:700;}
+.td-del button{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:10px;font-family:var(--font-ui);transition:all .15s;}
+.td-del button:hover{border-color:var(--red);color:var(--red);}
+.tm-empty{font-size:11px;color:var(--muted);font-style:italic;padding:12px 10px;}
+
+/* ─── ADD TRANSITION FORM ─────────────────────────────── */
+.add-trans-form{display:none;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px;background:var(--bg);border:1px dashed var(--border);border-radius:8px;padding:10px 12px;}
+.add-trans-form.visible{display:flex;}
+.add-trans-form select{background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--font-mono);font-size:12px;padding:7px 9px;border-radius:5px;outline:none;width:auto;margin:0;cursor:pointer;}
+.add-trans-form select:focus{border-color:var(--accent);}
+.atf-arrow{color:var(--muted);font-family:var(--font-mono);font-size:15px;font-weight:700;}
+.atf-add{padding:7px 16px;background:var(--accent);border:none;color:#fff;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;white-space:nowrap;font-family:var(--font-ui);}
+.atf-add:hover{background:var(--accent-hover);}
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    if (window.self !== window.top) {
+        const header = document.querySelector('header');
+        if (header) {
+            header.style.display = 'none';
+        }
+    }
+});
+</script>
+</head>
+<body>
+
+<!-- ══ HEADER ══ -->
+<header>
+  <h1>TURING MACHINE</h1>
+  <span class="hdr-sep">|</span>
+  <span class="hdr-sub">Simulator &amp; Visualizer</span>
+  <div class="hdr-badge" id="hdr-badge">
+    <span class="dot dot-yellow" id="badge-dot"></span>
+    <span id="badge-txt">No machine loaded</span>
+  </div>
+  <button class="theme-btn" onclick="toggleTheme()">
+    <span id="theme-icon">☀</span><span id="theme-label">Light</span>
+  </button>
+</header>
+
+<div class="main">
+<!-- ══ SIDEBAR ══ -->
+<div class="sidebar">
+
+  <!-- Neo4j -->
+  <div class="sec">
+    <button class="conn-toggle-btn" id="conn-panel-toggle" onclick="toggleConnPanel()">
+      <span>Neo4j Database</span><span class="conn-caret">▼</span>
+    </button>
+    <div class="conn-fields open" id="conn-fields">
+      <label style="margin-top:10px">URI</label>
+      <input type="text"     id="neo4j-uri"  value="neo4j://127.0.0.1:7687">
+      <label>Username</label>
+      <input type="text"     id="neo4j-user" value="neo4j">
+      <label>Password</label>
+      <input type="password" id="neo4j-pass">
+      <input type="hidden"   id="neo4j-db"   value="neo4j">
+      <button class="btn-primary" id="btn-connect" onclick="neoConnect()">⚡ CONNECT</button>
+    </div>
+  </div>
+
+  <!-- Saved TMs -->
+  <div class="sec pda-select-sec" id="tm-select-sec">
+    <div class="sec-title">Saved Machines</div>
+    <select id="tm-dropdown" onchange="onTmDropdownChange()">
+      <option value="">-- select saved TM --</option>
+    </select>
+    <div class="pda-db-info" id="tm-db-info"></div>
+    <div style="display:flex;gap:6px">
+      <button class="btn-ghost" id="btn-load-tm" onclick="loadSavedTM()" disabled style="flex:1">▶ LOAD</button>
+      <button onclick="deleteSavedTM()" id="btn-delete-tm" disabled
+        style="background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:7px 11px;cursor:pointer;font-size:13px;transition:all .15s"
+        onmouseover="this.style.borderColor='var(--red)';this.style.color='var(--red)'"
+        onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--muted)'">🗑</button>
+    </div>
+  </div>
+
+  <!-- Machine Actions -->
+  <div class="sec">
+    <div class="sec-title">Machine</div>
+    <button class="btn-primary" onclick="openTMModal()">＋ CREATE / EDIT MACHINE</button>
+    <button class="btn-danger" onclick="clearTM()">✕ Clear Machine</button>
+    <!-- Import is always visible so users can load a .tm file from the start -->
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <button class="io-btn" style="flex:1" onclick="document.getElementById('import-file').click()">↑ Import .tm</button>
+    </div>
+    <input type="file" id="import-file" accept=".tm,.json" style="display:none" onchange="importTMFile(event)">
+    <!-- Export + DB Save only appear once a machine is loaded -->
+    <div class="io-row" id="io-row">
+      <button class="io-btn" onclick="exportTM()">↓ Export .tm</button>
+      <button class="io-btn" id="btn-save-neo4j" onclick="saveTMtoNeo4j()">☁ Save to DB</button>
+    </div>
+    <div class="tm-card" id="tm-card"><em style="color:var(--muted)">No machine loaded. Click above to create one.</em></div>
+  </div>
+
+  <!-- States Panel -->
+  <div class="sec" id="states-sec" style="display:none">
+    <div class="sec-title">States</div>
+    <div class="state-pills" id="state-pills"></div>
+  </div>
+
+  <!-- Simulation -->
+  <div class="sec" id="sim-sec" style="display:none">
+    <div class="sec-title">Simulation</div>
+    <label>Input String</label>
+    <input type="text" id="sim-input" placeholder="e.g.  aabb   (empty for ε)"
+           onkeydown="if(event.key==='Enter')startSim()">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <label style="margin:0;font-size:11px;white-space:nowrap">Max Steps</label>
+      <input type="number" id="max-steps-inp" value="500" min="10" max="9999"
+        style="width:80px;margin:0" onchange="maxSteps=Math.max(10,parseInt(this.value)||500)">
+    </div>
+    <div id="quick-btns" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px"></div>
+    <div class="btn-row">
+      <button class="btn-ghost" id="btn-back" onclick="stepBack()" disabled style="flex:0 0 auto;min-width:72px">◀ BACK</button>
+      <button class="btn-ghost" id="btn-step" onclick="stepSim()" disabled>STEP ▶</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-run"   id="btn-run"   onclick="runAll()"   disabled>▶ RUN</button>
+      <button class="btn-ghost" id="btn-reset" onclick="resetSim()" disabled>↺ RESET</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+      <span style="font-size:8px;color:var(--muted);letter-spacing:1.5px">FAST</span>
+      <input type="range" id="speed-slider" min="60" max="1400" value="420" step="60" style="flex:1">
+      <span style="font-size:8px;color:var(--muted);letter-spacing:1.5px">SLOW</span>
+    </div>
+    <div id="result"></div>
+  </div>
+
+  <!-- Trace -->
+  <div class="sec" id="trace-sec" style="display:none">
+    <div class="sec-title">Computation Trace</div>
+    <div class="trace-scroll" id="trace">
+      <div class="trace-line" style="font-style:italic;justify-content:center;color:var(--muted)">Press STEP or RUN to start…</div>
+    </div>
+  </div>
+
+  <!-- Legend -->
+  <div class="sec">
+    <div class="sec-title">Legend</div>
+    <div class="legend">
+      <div class="li"><div class="lc" style="color:var(--accent)"></div>Regular state</div>
+      <div class="li"><div class="lc" style="color:var(--green);outline:2px solid var(--green);outline-offset:3px"></div>Accept state (double ring)</div>
+      <div class="li"><div class="lc" style="color:var(--red);border-style:dashed"></div>Reject state (dashed ring)</div>
+      <div class="li"><div class="lc" style="color:var(--yellow);box-shadow:0 0 8px var(--yellow)"></div>Active state</div>
+      <div class="li" style="margin-top:4px">
+        <span style="font-family:var(--font-mono);font-size:11px;color:var(--yellow);background:var(--card);padding:1px 6px;border-radius:4px">r→w,D</span>
+        <span style="margin-left:4px">read r, write w, move D(ir)</span>
+      </div>
+      <div class="li" style="margin-top:2px">
+        <span style="font-family:var(--font-mono);font-size:12px;color:var(--cyan)">⊔</span>
+        <span style="margin-left:8px">blank symbol</span>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /sidebar -->
+
+<!-- ══ CANVAS AREA ══ -->
+<div class="canvas-area">
+
+  <div class="canvas-bar" id="canvas-bar">
+    <span id="bar-text">Create a Turing Machine to begin</span>
+    <div class="view-toggle" id="view-toggle">
+      <button class="view-btn active" id="btn-view-diag" onclick="setViewMode('diagram')">⬡ Diagram</button>
+      <button class="view-btn"        id="btn-view-st"   onclick="setViewMode('spacetime')">⊞ Tape History</button>
+    </div>
+  </div>
+
+  <div class="canvas-hint" id="canvas-hint">
+    <h2>TURING MACHINE</h2>
+    <p>Click "CREATE / EDIT MACHINE" to begin</p>
+  </div>
+
+  <!-- State diagram SVG -->
+  <svg id="svg-canvas" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arr"    markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#818cf8"/></marker>
+      <marker id="arr-y"  markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#f59e0b"/></marker>
+      <marker id="arr-c"  markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#22d3ee"/></marker>
+      <marker id="arr-g"  markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#10b981"/></marker>
+      <marker id="arr-r"  markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#ef4444"/></marker>
+      <marker id="arr-dk" markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#4f46e5"/></marker>
+      <marker id="arr-dc" markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#0891b2"/></marker>
+      <marker id="arr-dg" markerWidth="11" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="#059669"/></marker>
+      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur stdDeviation="4" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+    <g id="viewport"></g>
+  </svg>
+
+  <!-- Space-Time history view -->
+  <div id="st-container">
+    <div class="st-title">TAPE SPACE-TIME DIAGRAM</div>
+    <div class="st-legend">
+      <div class="stl-item"><div class="stl-dot" style="background:rgba(245,158,11,.8)"></div>Head position</div>
+      <div class="stl-item"><div class="stl-dot" style="background:rgba(34,211,238,.5)"></div>Written cell</div>
+      <div class="stl-item"><div class="stl-dot" style="background:#1e293b;border:1px solid #475569"></div>Blank / untouched</div>
+      <div style="margin-left:auto;font-size:10px;color:var(--muted)">← tape position →&nbsp;&nbsp;↓ step</div>
+    </div>
+    <canvas id="st-canvas"></canvas>
+  </div>
+
+  <!-- Floating config panel (top-right) -->
+  <div class="config-display" id="config-display">
+    <div class="cfg-row"><span class="cfg-lbl">STATE</span><span class="cfg-val" id="cfg-state">—</span></div>
+    <div class="cfg-row"><span class="cfg-lbl">HEAD</span><span class="cfg-val" id="cfg-head">—</span></div>
+    <div class="cfg-row"><span class="cfg-lbl">SYMBOL</span><span class="cfg-val" id="cfg-sym">—</span></div>
+    <div class="cfg-row"><span class="cfg-lbl">STEP</span><span class="cfg-val" id="cfg-step">—</span></div>
+  </div>
+
+  <!-- Floating tape -->
+  <div class="canvas-tape" id="canvas-tape" style="display:none">
+    <span class="ct-label">Tape</span>
+    <div class="tape-track">
+      <span class="tape-ellipsis">…</span>
+      <div id="tape-cells" style="display:flex;gap:2px"></div>
+      <span class="tape-ellipsis">…</span>
+    </div>
+  </div>
+
+  <!-- Zoom controls -->
+  <div class="floating-controls">
+    <button onclick="zoomBy(1.2)" title="Zoom In">+</button>
+    <button onclick="zoomBy(0.83)" title="Zoom Out">−</button>
+    <button onclick="fitView()" class="fit-btn">FIT</button>
+  </div>
+
+</div><!-- /canvas-area -->
+</div><!-- /main -->
+
+
+<!-- ══ TM BUILDER MODAL ══ -->
+<div class="modal-overlay" id="tm-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>⚙ TURING MACHINE BUILDER</h2>
+      <button class="modal-close" onclick="closeTMModal()">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- ① Presets -->
+      <div>
+        <div class="modal-sec-title">① Quick Presets</div>
+        <div class="preset-grid" id="preset-grid"></div>
+      </div>
+
+      <!-- ② Name -->
+      <div>
+        <div class="modal-sec-title">② Machine Name</div>
+        <input type="text" id="m-name" placeholder="e.g.  aⁿbⁿ Recognizer" style="max-width:360px;margin-bottom:0">
+      </div>
+
+      <!-- ③ States -->
+      <div>
+        <div class="modal-sec-title">③ States &amp; Roles</div>
+        <div class="alpha-pills" id="m-state-pills"></div>
+        <div style="display:flex;gap:9px;margin-top:11px;align-items:flex-end;flex-wrap:wrap">
+          <div class="form-group" style="flex:0 0 160px">
+            <label>New State Name</label>
+            <input type="text" id="m-state-inp" placeholder="e.g. q0  q_acc" maxlength="14"
+                   onkeydown="if(event.key==='Enter')mAddState()" style="margin-bottom:0">
+          </div>
+          <button onclick="mAddState()" style="height:36px;padding:0 18px;background:var(--accent);border:none;color:#fff;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--font-ui);flex-shrink:0">ADD</button>
+          <div class="form-group" style="flex:0 0 130px">
+            <label>Start State</label>
+            <select id="m-start-sel" style="margin-bottom:0"><option value="">-- none --</option></select>
+          </div>
+          <div class="form-group" style="flex:0 0 130px">
+            <label>Accept State</label>
+            <select id="m-accept-sel" style="margin-bottom:0"><option value="">-- none --</option></select>
+          </div>
+          <div class="form-group" style="flex:0 0 155px">
+            <label>Reject State <em style="font-style:normal;color:var(--muted);font-size:10px">(optional)</em></label>
+            <select id="m-reject-sel" style="margin-bottom:0"><option value="">-- none --</option></select>
+          </div>
+        </div>
+      </div>
+
+      <!-- ④ Tape Alphabet -->
+      <div>
+        <div class="modal-sec-title">④ Tape Alphabet Γ &nbsp;<em style="font-style:normal;font-size:9px;letter-spacing:0;text-transform:none;color:var(--muted)">blank ⊔ is always included</em></div>
+        <div class="alpha-pills" id="m-sym-pills"></div>
+        <div class="qset" style="margin-top:9px">
+          <button class="qs-btn" onclick="mAddSymSet(['a','b'])">{ a, b }</button>
+          <button class="qs-btn" onclick="mAddSymSet(['0','1'])">{ 0, 1 }</button>
+          <button class="qs-btn" onclick="mAddSymSet(['X','Y'])">{ X, Y }</button>
+          <button class="qs-btn" onclick="mAddSymSet(['a','b','X','Y'])">{ a, b, X, Y }</button>
+        </div>
+        <div style="display:flex;gap:9px;align-items:flex-end">
+          <div class="form-group" style="flex:0 0 160px">
+            <label>Add Symbol</label>
+            <input type="text" id="m-sym-inp" placeholder="e.g. a  X  #" maxlength="5"
+                   onkeydown="if(event.key==='Enter')mAddSym()" style="margin-bottom:0">
+          </div>
+          <button onclick="mAddSym()" style="height:36px;padding:0 18px;background:var(--accent);border:none;color:#fff;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--font-ui);flex-shrink:0">ADD</button>
+        </div>
+      </div>
+
+      <!-- ⑤ Transitions -->
+      <div>
+        <div class="modal-sec-title">⑤ Transition Function δ &nbsp;<em style="font-style:normal;font-size:9px;letter-spacing:0;text-transform:none;color:var(--muted)">δ(state, read) = (next, write, direction) — each (state,read) pair must be unique</em></div>
+        <div class="tm-table-wrap">
+          <table class="tm-table">
+            <thead>
+              <tr>
+                <th>State</th><th>Read</th><th></th>
+                <th>Write</th><th>Dir</th><th>Next State</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="m-trans-tbody">
+              <tr><td colspan="7" class="tm-empty">Add states and symbols first, then define transitions.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="add-trans-form" id="m-add-trans-form">
+          <select id="m-from-sel" title="Current state"></select>
+          <select id="m-read-sel" title="Read symbol" style="min-width:58px"></select>
+          <span class="atf-arrow">→</span>
+          <select id="m-write-sel" title="Write symbol" style="min-width:58px"></select>
+          <select id="m-dir-sel" title="Head direction" style="min-width:52px">
+            <option value="R">R →</option>
+            <option value="L">L ←</option>
+          </select>
+          <select id="m-to-sel" title="Next state"></select>
+          <button class="atf-add" onclick="mAddTrans()">＋ ADD</button>
+        </div>
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <span class="modal-msg" id="modal-msg"></span>
+      <button class="btn-modal-cancel" onclick="closeTMModal()">CANCEL</button>
+      <button class="btn-modal-save" onclick="applyTM()">✓ APPLY MACHINE</button>
+    </div>
+  </div>
+</div><!-- /modal -->
+
+
+<script>
+// ════════════════════════════════════════════════════════
+//  EXPORT / IMPORT
+// ════════════════════════════════════════════════════════
+function exportTM(){
+  if(!tm){toast('No machine to export','err');return;}
+  const obj={version:'1.0',name:tm.name,states:tm.states,startState:tm.start,
+    acceptState:tm.accept,rejectState:tm.reject,tapeAlphabet:tm.tapeAlpha,
+    blankSymbol:tm.blank,transitions:tm.trans,createdAt:new Date().toISOString().split('T')[0]};
+  const blob=new Blob([JSON.stringify(obj,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=(tm.name||'machine').replace(/[^a-z0-9_-]/gi,'_').toLowerCase()+'.tm';
+  a.click();URL.revokeObjectURL(a.href);toast('Exported: '+tm.name+'.tm','ok');
+}
+function importTMFile(e){
+  const file=e.target.files[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    try{
+      const o=JSON.parse(ev.target.result);
+      tm={name:o.name||'Imported TM',states:o.states||[],start:o.startState||'',
+        accept:o.acceptState||'',reject:o.rejectState||null,
+        tapeAlpha:o.tapeAlphabet||[],blank:o.blankSymbol||BLANK,trans:o.transitions||[]};
+      onTMApplied();toast('Imported: '+tm.name,'ok');
+    }catch(err){toast('Invalid .tm file: '+err.message,'err');}
+  };
+  reader.readAsText(file);e.target.value='';
+}
+
+// ════════════════════════════════════════════════════════
+//  PRESETS
+// ════════════════════════════════════════════════════════
+const BLANK='⊔';
+
+const TM_PRESETS=[
+  {
+    id:'replace_ab',name:'Replace a → b',lang:"Rewrites all a's to b's  (intro TM)",
+    states:['q0','q_acc'],start:'q0',accept:'q_acc',reject:null,
+    tapeAlpha:['a','b',BLANK],blank:BLANK,
+    trans:[
+      {from:'q0',read:'a',write:'b',dir:'R',to:'q0'},
+      {from:'q0',read:'b',write:'b',dir:'R',to:'q0'},
+      {from:'q0',read:BLANK,write:BLANK,dir:'R',to:'q_acc'},
+    ],
+    ex:['aaa','aba','bbb','aaabb','']
+  },
+  {
+    id:'even_a',name:"Even #a's",lang:"{ w ∈ {a,b}* | #a(w) is even }",
+    states:['q_even','q_odd','q_acc','q_rej'],start:'q_even',accept:'q_acc',reject:'q_rej',
+    tapeAlpha:['a','b',BLANK],blank:BLANK,
+    trans:[
+      {from:'q_even',read:'a',write:'a',dir:'R',to:'q_odd'},
+      {from:'q_even',read:'b',write:'b',dir:'R',to:'q_even'},
+      {from:'q_even',read:BLANK,write:BLANK,dir:'R',to:'q_acc'},
+      {from:'q_odd', read:'a',write:'a',dir:'R',to:'q_even'},
+      {from:'q_odd', read:'b',write:'b',dir:'R',to:'q_odd'},
+      {from:'q_odd', read:BLANK,write:BLANK,dir:'R',to:'q_rej'},
+    ],
+    ex:['','aa','aabb','ab','a','aab','bba']
+  },
+  {
+    id:'anbn',name:'aⁿbⁿ  (n ≥ 1)',lang:'{ aⁿbⁿ | n ≥ 1 }  — crossing-off technique',
+    states:['q0','q1','q2','q3','q_acc','q_rej'],start:'q0',accept:'q_acc',reject:'q_rej',
+    tapeAlpha:['a','b','X','Y',BLANK],blank:BLANK,
+    trans:[
+      {from:'q0',read:'a',write:'X',dir:'R',to:'q1'},
+      {from:'q0',read:'Y',write:'Y',dir:'R',to:'q3'},
+      {from:'q0',read:'b',write:'b',dir:'R',to:'q_rej'},
+      {from:'q0',read:BLANK,write:BLANK,dir:'R',to:'q_rej'},
+      {from:'q1',read:'a',write:'a',dir:'R',to:'q1'},
+      {from:'q1',read:'Y',write:'Y',dir:'R',to:'q1'},
+      {from:'q1',read:'b',write:'Y',dir:'L',to:'q2'},
+      {from:'q1',read:BLANK,write:BLANK,dir:'R',to:'q_rej'},
+      {from:'q2',read:'a',write:'a',dir:'L',to:'q2'},
+      {from:'q2',read:'Y',write:'Y',dir:'L',to:'q2'},
+      {from:'q2',read:'X',write:'X',dir:'R',to:'q0'},
+      {from:'q3',read:'Y',write:'Y',dir:'R',to:'q3'},
+      {from:'q3',read:BLANK,write:BLANK,dir:'R',to:'q_acc'},
+      {from:'q3',read:'b',write:'b',dir:'R',to:'q_rej'},
+    ],
+    ex:['ab','aabb','aaabbb','a','b','aab','abb','aaabb']
+  },
+  {
+    id:'bininc',name:'Binary Increment',lang:'w (binary) ↦ w + 1',
+    states:['q_scan','q_carry','q_done'],start:'q_scan',accept:'q_done',reject:null,
+    tapeAlpha:['0','1',BLANK],blank:BLANK,
+    trans:[
+      {from:'q_scan',read:'0',write:'0',dir:'R',to:'q_scan'},
+      {from:'q_scan',read:'1',write:'1',dir:'R',to:'q_scan'},
+      {from:'q_scan',read:BLANK,write:BLANK,dir:'L',to:'q_carry'},
+      {from:'q_carry',read:'1',write:'0',dir:'L',to:'q_carry'},
+      {from:'q_carry',read:'0',write:'1',dir:'R',to:'q_done'},
+      {from:'q_carry',read:BLANK,write:'1',dir:'R',to:'q_done'},
+    ],
+    ex:['0','1','10','11','100','101','111','1111']
+  },
+  {
+    id:'unary_add',name:'Unary Addition',lang:'1ⁿ 0 1ᵐ  →  1ⁿ⁺ᵐ',
+    states:['q_scan','q_fix','q_erase','q_acc'],start:'q_scan',accept:'q_acc',reject:null,
+    tapeAlpha:['0','1',BLANK],blank:BLANK,
+    trans:[
+      {from:'q_scan',read:'1',write:'1',dir:'R',to:'q_scan'},
+      {from:'q_scan',read:'0',write:'1',dir:'R',to:'q_fix'},
+      {from:'q_fix', read:'1',write:'1',dir:'R',to:'q_fix'},
+      {from:'q_fix', read:BLANK,write:BLANK,dir:'L',to:'q_erase'},
+      {from:'q_erase',read:'1',write:BLANK,dir:'R',to:'q_acc'},
+    ],
+    ex:['10','110','1110','11011','1110111']
+  },
+];
+
+// ════════════════════════════════════════════════════════
+//  GLOBAL STATE
+// ════════════════════════════════════════════════════════
+let tm          = null;
+let mTM         = {name:'',states:[],start:'',accept:'',reject:'',tapeAlpha:[],blank:BLANK,trans:[]};
+let activePreset= null;
+let simSteps    = [];
+let simCur      = -1;
+let isPlaying   = false;
+let playTimer   = null;
+let nodePos     = {};
+let vx=0,vy=0,vz=1;
+let dragging=false,dragStart={x:0,y:0};
+let draggingNode= null;
+let viewMode    = 'diagram';
+let maxSteps    = 500;
+
+// ════════════════════════════════════════════════════════
+//  INIT
+// ════════════════════════════════════════════════════════
+window.addEventListener('DOMContentLoaded',()=>{
+  renderPresetGrid();
+  initSVGPan();
+  const p=localStorage.getItem('tm_neo4j_pass');
+  if(p){const el=document.getElementById('neo4j-pass');if(el)el.value=p;}
+});
+
+// ════════════════════════════════════════════════════════
+//  PRESET GRID
+// ════════════════════════════════════════════════════════
+function renderPresetGrid(){
+  document.getElementById('preset-grid').innerHTML=TM_PRESETS.map(p=>`
+    <div class="preset-item${activePreset===p.id?' selected':''}" onclick="selectPreset('${p.id}')">
+      <div class="pi-name">${escH(p.name)}</div>
+      <div class="pi-lang">${escH(p.lang)}</div>
+    </div>`).join('');
+}
+function selectPreset(id){
+  const p=TM_PRESETS.find(x=>x.id===id);if(!p)return;
+  activePreset=id;
+  mTM={name:p.name,states:[...p.states],start:p.start,accept:p.accept,reject:p.reject||'',
+    tapeAlpha:[...p.tapeAlpha],blank:p.blank,trans:JSON.parse(JSON.stringify(p.trans))};
+  document.getElementById('m-name').value=p.name;
+  syncModalUI();renderPresetGrid();showModalMsg('');
+}
+
+// ════════════════════════════════════════════════════════
+//  MODAL: OPEN / CLOSE / SYNC
+// ════════════════════════════════════════════════════════
+function openTMModal(){
+  if(tm){mTM=JSON.parse(JSON.stringify({name:tm.name,states:tm.states,start:tm.start,
+    accept:tm.accept,reject:tm.reject||'',tapeAlpha:tm.tapeAlpha,blank:tm.blank,trans:tm.trans}));}
+  else{mTM={name:'',states:[],start:'',accept:'',reject:'',tapeAlpha:[],blank:BLANK,trans:[]};}
+  document.getElementById('m-name').value=mTM.name;
+  showModalMsg('');syncModalUI();renderPresetGrid();
+  document.getElementById('tm-modal').classList.add('open');
+}
+function closeTMModal(){document.getElementById('tm-modal').classList.remove('open');}
+
+function syncModalUI(){
+  renderMStates();renderMSymbols();renderMStateSels();renderMTransTable();
+}
+
+/* ── State pills in modal ──────────────────────────── */
+function renderMStates(){
+  const el=document.getElementById('m-state-pills');
+  if(!mTM.states.length){
+    el.innerHTML='<span style="font-size:11px;color:var(--muted);font-style:italic">No states yet…</span>';return;
+  }
+  el.innerHTML=mTM.states.map(s=>{
+    let cls='alpha-pill state-p';
+    if(s===mTM.accept)cls='alpha-pill accept-p';
+    else if(s===mTM.reject)cls='alpha-pill reject-p';
+    const b=[];
+    if(s===mTM.start) b.push(`<span class="start-badge" style="background:var(--accent);color:#fff">START</span>`);
+    if(s===mTM.accept)b.push(`<span class="start-badge" style="background:var(--green);color:#fff">ACC</span>`);
+    if(s===mTM.reject)b.push(`<span class="start-badge" style="background:var(--red);color:#fff">REJ</span>`);
+    return`<div class="${cls}">${escH(s)}${b.join('')}<button onclick="mRemoveState('${escH(s)}')">&#215;</button></div>`;
+  }).join('');
+}
+
+/* ── Tape alphabet pills ───────────────────────────── */
+function renderMSymbols(){
+  const el=document.getElementById('m-sym-pills');
+  let html=`<div class="alpha-pill blank-p">${escH(BLANK)}<span style="font-size:9px;margin-left:2px">(blank)</span></div>`;
+  html+=mTM.tapeAlpha.filter(s=>s!==BLANK).map(s=>
+    `<div class="alpha-pill sym-p">${escH(s)}<button onclick="mRemoveSym('${escH(s)}')">&#215;</button></div>`
+  ).join('');
+  el.innerHTML=html;
+}
+
+/* ── Role selects ──────────────────────────────────── */
+function renderMStateSels(){
+  const opts='<option value="">-- none --</option>'+mTM.states.map(s=>`<option value="${escH(s)}">${escH(s)}</option>`).join('');
+  ['m-start-sel','m-accept-sel','m-reject-sel'].forEach(id=>{
+    const sel=document.getElementById(id);sel.innerHTML=opts;
+  });
+  document.getElementById('m-start-sel').value=mTM.start||'';
+  document.getElementById('m-accept-sel').value=mTM.accept||'';
+  document.getElementById('m-reject-sel').value=mTM.reject||'';
+}
+
+/* ── Transition table ──────────────────────────────── */
+function renderMTransTable(){
+  const tbody=document.getElementById('m-trans-tbody');
+  const form=document.getElementById('m-add-trans-form');
+  const hasStates=mTM.states.length>0,hasSyms=mTM.tapeAlpha.length>0;
+  const fullAlpha=[BLANK,...mTM.tapeAlpha.filter(s=>s!==BLANK)];
+
+  if(!hasStates||!hasSyms){
+    tbody.innerHTML='<tr><td colspan="7" class="tm-empty">Add states and symbols first.</td></tr>';
+    form.classList.remove('visible');return;
+  }
+  form.classList.add('visible');
+
+  // populate form selects (keep selection)
+  const stOpts=mTM.states.map(s=>`<option value="${escH(s)}">${escH(s)}</option>`).join('');
+  const syOpts=fullAlpha.map(s=>`<option value="${escH(s)}">${escH(s)}</option>`).join('');
+  ['m-from-sel','m-to-sel'].forEach(id=>{const sel=document.getElementById(id),pv=sel.value;sel.innerHTML=stOpts;if(mTM.states.includes(pv))sel.value=pv;});
+  ['m-read-sel','m-write-sel'].forEach(id=>{const sel=document.getElementById(id),pv=sel.value;sel.innerHTML=syOpts;if(fullAlpha.includes(pv))sel.value=pv;});
+
+  if(!mTM.trans.length){
+    tbody.innerHTML='<tr><td colspan="7" class="tm-empty">No transitions yet. Use the form below to add.</td></tr>';return;
+  }
+  tbody.innerHTML=mTM.trans.map((t,i)=>`
+    <tr>
+      <td class="td-state">${escH(t.from)}</td>
+      <td class="td-sym">${escH(t.read)}</td>
+      <td class="td-arrow">→</td>
+      <td class="td-write">${escH(t.write)}</td>
+      <td class="td-dir">${t.dir}</td>
+      <td class="td-to">${escH(t.to)}</td>
+      <td class="td-del"><button onclick="mRemoveTrans(${i})">✕</button></td>
+    </tr>`).join('');
+}
+
+// ════════════════════════════════════════════════════════
+//  MODAL: ADD / REMOVE OPERATIONS
+// ════════════════════════════════════════════════════════
+function mAddState(){
+  const raw=document.getElementById('m-state-inp').value.trim();
+  if(!raw){showModalMsg('Enter a state name','err');return;}
+  raw.split(/\s+/).filter(Boolean).forEach(s=>{
+    if(mTM.states.includes(s)){showModalMsg(`'${s}' already exists`,'err');return;}
+    mTM.states.push(s);
+    if(!mTM.start)mTM.start=s;
+  });
+  document.getElementById('m-state-inp').value='';
+  activePreset=null;syncModalUI();renderPresetGrid();showModalMsg('');
+}
+function mRemoveState(s){
+  mTM.states=mTM.states.filter(x=>x!==s);
+  mTM.trans=mTM.trans.filter(t=>t.from!==s&&t.to!==s);
+  if(mTM.start===s)mTM.start=mTM.states[0]||'';
+  if(mTM.accept===s)mTM.accept='';
+  if(mTM.reject===s)mTM.reject='';
+  activePreset=null;syncModalUI();renderPresetGrid();
+}
+function mAddSym(){
+  const raw=document.getElementById('m-sym-inp').value.trim();
+  if(!raw){showModalMsg('Enter a symbol','err');return;}
+  raw.split(/\s+/).filter(Boolean).forEach(s=>{
+    if(s===BLANK){showModalMsg('⊔ is always included','err');return;}
+    if(mTM.tapeAlpha.includes(s)){showModalMsg(`'${s}' already exists`,'err');return;}
+    mTM.tapeAlpha.push(s);
+  });
+  document.getElementById('m-sym-inp').value='';
+  activePreset=null;syncModalUI();renderPresetGrid();showModalMsg('');
+}
+function mAddSymSet(arr){arr.forEach(s=>{if(!mTM.tapeAlpha.includes(s))mTM.tapeAlpha.push(s);});activePreset=null;syncModalUI();renderPresetGrid();}
+function mRemoveSym(s){mTM.tapeAlpha=mTM.tapeAlpha.filter(x=>x!==s);mTM.trans=mTM.trans.filter(t=>t.read!==s&&t.write!==s);activePreset=null;syncModalUI();renderPresetGrid();}
+
+function mAddTrans(){
+  const from=v('m-from-sel'),read=v('m-read-sel'),write=v('m-write-sel'),dir=v('m-dir-sel'),to=v('m-to-sel');
+  if(!from||!read||!write||!dir||!to){showModalMsg('Fill in all five fields','err');return;}
+  if(mTM.trans.some(t=>t.from===from&&t.read===read)){
+    showModalMsg(`Conflict: δ(${from}, ${read}) already defined — TM must be deterministic`,'err');return;
+  }
+  mTM.trans.push({from,read,write,dir,to});
+  activePreset=null;renderMTransTable();showModalMsg('');
+}
+function mRemoveTrans(i){mTM.trans.splice(i,1);renderMTransTable();}
+function showModalMsg(text,type){const el=document.getElementById('modal-msg');el.className='modal-msg'+(type?' '+type:'');el.textContent=text||'';}
+
+// ════════════════════════════════════════════════════════
+//  APPLY TM
+// ════════════════════════════════════════════════════════
+function applyTM(){
+  mTM.start  = v('m-start-sel');
+  mTM.accept = v('m-accept-sel');
+  mTM.reject = v('m-reject-sel')||null;
+  mTM.name   = document.getElementById('m-name').value.trim()||'Custom TM';
+
+  if(!mTM.states.length){showModalMsg('Add at least one state','err');return;}
+  if(!mTM.start)         {showModalMsg('Select a start state','err');return;}
+  if(!mTM.accept)        {showModalMsg('Select an accept state','err');return;}
+  if(!mTM.tapeAlpha.length){showModalMsg('Add at least one tape symbol','err');return;}
+  if(!mTM.tapeAlpha.includes(BLANK))mTM.tapeAlpha.push(BLANK);
+
+  tm=JSON.parse(JSON.stringify(mTM));
+  closeTMModal();
+  onTMApplied();
+  toast('Machine "'+tm.name+'" applied!','ok');
+}
+
+function onTMApplied(){
+  layoutTM();drawTM(null,null);
+  updateSidebarTM();showSidebarSections();resetSim();
+  // Re-enable step/run now that a machine is loaded
+  document.getElementById('btn-step').disabled=false;
+  document.getElementById('btn-run').disabled=false;
+  document.getElementById('canvas-hint').style.display='none';
+  document.getElementById('io-row').style.display='flex';
+  document.getElementById('view-toggle').style.display='flex';
+  fitView();
+  setBadge('ok',tm.name+' — '+tm.states.length+' states, '+tm.trans.length+' transitions');
+  setBar('"'+tm.name+'" loaded — enter an input string and press STEP or RUN');
+}
+
+// ════════════════════════════════════════════════════════
+//  LAYOUT  (circle arrangement)
+// ════════════════════════════════════════════════════════
+const R_NODE=34,R_OUTER=49;
+
+function layoutTM(){
+  const svg=document.getElementById('svg-canvas');
+  const W=svg.clientWidth||900,H=svg.clientHeight||560;
+  const n=tm.states.length;if(!n)return;
+  const cx=W/2,cy=H/2;
+  const radius=n===1?0:Math.max(160,(n*75)/(2*Math.PI));
+  tm.states.forEach((s,i)=>{
+    const angle=(2*Math.PI*i/n)-(Math.PI/2);
+    nodePos[s]={x:cx+radius*Math.cos(angle),y:cy+radius*Math.sin(angle)};
+  });
+  vx=0;vy=0;vz=1;setViewport();
+}
+
+// ════════════════════════════════════════════════════════
+//  SVG HELPERS
+// ════════════════════════════════════════════════════════
+function makeEl(tag){return document.createElementNS('http://www.w3.org/2000/svg',tag);}
+function attr(el,obj){Object.entries(obj).forEach(([k,val])=>el.setAttribute(k,val));return el;}
+function makeText(p,x,y,txt,props){const t=makeEl('text');attr(t,{x,y,...props});t.textContent=txt;p.appendChild(t);return t;}
+function makeRect(p,x,y,w,h,rx,props){const r=makeEl('rect');attr(r,{x,y,width:w,height:h,rx,...props});p.appendChild(r);return r;}
+
+function getStateColor(name){
+  const L=document.documentElement.classList.contains('light');
+  if(name===tm?.accept)return L?'#059669':'#10b981';
+  if(name===tm?.reject)return L?'#dc2626':'#ef4444';
+  if(name===tm?.start) return L?'#4f46e5':'#818cf8';
+  return L?'#0891b2':'#22d3ee';
+}
+function getArrowMarker(col,hl){
+  if(hl)return'url(#arr-y)';
+  const L=document.documentElement.classList.contains('light');
+  if(col==='#10b981'||col==='#059669')return L?'url(#arr-dg)':'url(#arr-g)';
+  if(col==='#ef4444'||col==='#dc2626')return'url(#arr-r)';
+  if(col==='#818cf8'||col==='#4f46e5')return L?'url(#arr-dk)':'url(#arr)';
+  return L?'url(#arr-dc)':'url(#arr-c)';
+}
+
+// ════════════════════════════════════════════════════════
+//  DRAW TM
+// ════════════════════════════════════════════════════════
+function drawTM(activeState,activeTrans){
+  const vp=document.getElementById('viewport');
+  vp.innerHTML='';
+  if(!tm||!tm.states.length)return;
+  const L=document.documentElement.classList.contains('light');
+
+  // Group transitions by (from,to) pair
+  const edgeMap=new Map();
+  for(const t of tm.trans){
+    const key=t.from+'|||'+t.to;
+    if(!edgeMap.has(key))edgeMap.set(key,[]);
+    edgeMap.get(key).push(t);
+  }
+
+  // Find bidirectional pairs
+  const bidir=new Set();
+  for(const [key] of edgeMap){
+    const[f,t2]=key.split('|||');
+    if(f!==t2&&edgeMap.has(t2+'|||'+f)){bidir.add(key);bidir.add(t2+'|||'+f);}
+  }
+
+  // Pass 1: draw edges
+  for(const[key,tlist] of edgeMap){
+    const[from,to]=key.split('|||');
+    const p1=nodePos[from],p2=nodePos[to];
+    if(!p1||!p2)continue;
+    const col=getStateColor(from);
+    const mkr=getArrowMarker(col,false);
+    const isHl=activeTrans&&tlist.some(t=>t.from===activeTrans.from&&t.read===activeTrans.read);
+    const strokeCol=isHl?'#f59e0b':col;
+    const marker=isHl?'url(#arr-y)':mkr;
+    if(from===to)drawSelfLoop(vp,p1,tlist,activeTrans,strokeCol,marker);
+    else drawEdge(vp,p1,p2,tlist,activeTrans,strokeCol,marker,bidir.has(key)?30:0);
+  }
+
+  // Pass 2: draw state nodes
+  for(const s of tm.states){const p=nodePos[s];if(p)drawStateNode(vp,s,p,s===activeState);}
+
+  // Start arrow
+  if(tm.start&&nodePos[tm.start]){
+    const sp=nodePos[tm.start];
+    const sc=L?'#4f46e5':'#818cf8';
+    const line=makeEl('line');
+    attr(line,{x1:sp.x-R_NODE-46,y1:sp.y,x2:sp.x-R_NODE-2,y2:sp.y,
+      stroke:sc,'stroke-width':2,'marker-end':L?'url(#arr-dk)':'url(#arr)'});
+    vp.appendChild(line);
+    makeText(vp,sp.x-R_NODE-25,sp.y-10,'start',{fill:sc,'font-size':10,'text-anchor':'middle','font-family':'Inter','font-weight':600});
+  }
+
+  // Pass 3: redraw labels on top
+  for(const s of tm.states){
+    const p=nodePos[s];if(!p)continue;
+    const col=getStateColor(s),active=s===activeState;
+    const fs=s.length>8?8:s.length>5?10:12;
+    makeText(vp,p.x,p.y+4,s,{fill:active?'#f59e0b':col,'font-size':fs,'font-weight':700,
+      'text-anchor':'middle',style:'pointer-events:none','font-family':'JetBrains Mono'});
+  }
+}
+
+function drawStateNode(vp,name,p,active){
+  const col=getStateColor(name);
+  const isAcc=name===tm?.accept,isRej=name===tm?.reject;
+  const L=document.documentElement.classList.contains('light');
+  const fill=active?(L?'rgba(245,158,11,.18)':'rgba(245,158,11,.12)'):(L?'rgba(248,250,252,.95)':'rgba(15,23,42,.92)');
+
+  // Double ring for accept
+  if(isAcc){
+    const oc=makeEl('circle');
+    attr(oc,{cx:p.x,cy:p.y,r:R_OUTER,fill:'none',stroke:active?'#f59e0b':col,'stroke-width':active?3:2});
+    if(active)oc.setAttribute('filter','url(#glow)');
+    vp.appendChild(oc);
+  }
+  // Main circle
+  const c=makeEl('circle');
+  attr(c,{cx:p.x,cy:p.y,r:R_NODE,fill,stroke:active?'#f59e0b':col,'stroke-width':active?3.5:2.5,
+    style:'cursor:move'+(isRej?';stroke-dasharray:5 3':'')});
+  if(active)c.setAttribute('filter','url(#glow)');
+  c.setAttribute('data-name',name);
+  c.addEventListener('mousedown',e=>{e.stopPropagation();draggingNode=name;});
+  vp.appendChild(c);
+}
+
+function drawEdge(vp,p1,p2,tlist,activeTrans,col,marker,curveOffset){
+  const dx=p2.x-p1.x,dy=p2.y-p1.y,dist=Math.sqrt(dx*dx+dy*dy);
+  if(dist<1)return;
+  const ux=dx/dist,uy=dy/dist,px=-uy,py=ux;
+  const isCurved=curveOffset!==0;
+  const x1=p1.x+ux*(R_NODE+2)+px*curveOffset,y1=p1.y+uy*(R_NODE+2)+py*curveOffset;
+  const x2=p2.x-ux*(R_NODE+6)+px*curveOffset,y2=p2.y-uy*(R_NODE+6)+py*curveOffset;
+  const mx=(x1+x2)/2+px*(isCurved?40:0),my=(y1+y2)/2+py*(isCurved?40:0);
+  const d=isCurved?`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`:`M ${x1} ${y1} L ${x2} ${y2}`;
+  const hl=activeTrans&&tlist.some(t=>t.from===activeTrans.from&&t.read===activeTrans.read);
+  const path=makeEl('path');
+  attr(path,{d,stroke:col,'stroke-width':hl?3.5:2,fill:'none','marker-end':marker});
+  vp.appendChild(path);
+  const lx=isCurved?mx:(x1+x2)/2+px*24,ly=isCurved?my:(y1+y2)/2+py*24;
+  tlist.forEach((t,i)=>{
+    const thl=activeTrans&&t.from===activeTrans.from&&t.read===activeTrans.read;
+    drawTransLabel(vp,lx,ly+i*22-(tlist.length-1)*11,fmtTMTrans(t),thl);
+  });
+}
+
+function drawSelfLoop(vp,p,tlist,activeTrans,col,marker){
+  const loopR=58,spread=0.5,angle=-Math.PI/2;
+  const a1=angle-spread,a2=angle+spread;
+  const sx=p.x+Math.cos(a1)*R_NODE,sy=p.y+Math.sin(a1)*R_NODE;
+  const ex=p.x+Math.cos(a2)*(R_NODE-3),ey=p.y+Math.sin(a2)*(R_NODE-3);
+  const c1x=p.x+Math.cos(a1)*(R_NODE+loopR*1.9),c1y=p.y+Math.sin(a1)*(R_NODE+loopR*1.9);
+  const c2x=p.x+Math.cos(a2)*(R_NODE+loopR*1.9),c2y=p.y+Math.sin(a2)*(R_NODE+loopR*1.9);
+  const hl=activeTrans&&tlist.some(t=>t.from===activeTrans.from&&t.read===activeTrans.read);
+  const path=makeEl('path');
+  attr(path,{d:`M ${sx} ${sy} C ${c1x} ${c1y},${c2x} ${c2y},${ex} ${ey}`,
+    stroke:col,'stroke-width':hl?3.5:2,fill:'none','marker-end':marker});
+  vp.appendChild(path);
+  const tipX=p.x+Math.cos(angle)*(R_NODE+loopR*2.18);
+  const tipY=p.y+Math.sin(angle)*(R_NODE+loopR*2.18);
+  tlist.forEach((t,i)=>{
+    const thl=activeTrans&&t.from===activeTrans.from&&t.read===activeTrans.read;
+    drawTransLabel(vp,tipX,tipY+i*22-(tlist.length-1)*11,fmtTMTrans(t),thl);
+  });
+}
+
+function drawTransLabel(vp,x,y,label,hl){
+  const w=label.length*7+16;
+  const L=document.documentElement.classList.contains('light');
+  const bg=hl?'#f59e0b':(L?'#ffffff':'#0f172a');
+  const bd=hl?'#d97706':(L?'#cbd5e1':'#334155');
+  makeRect(vp,x-w/2,y-12,w,23,4,{fill:bg,stroke:bd,'stroke-width':hl?2:1.2});
+  makeText(vp,x,y+5,label,{fill:hl?'#0f172a':(L?'#0f172a':'#f1f5f9'),
+    'font-size':11,'font-weight':hl?700:600,'text-anchor':'middle',
+    style:'pointer-events:none','font-family':'JetBrains Mono'});
+}
+function fmtTMTrans(t){return`${t.read}→${t.write},${t.dir}`;}
+
+// ════════════════════════════════════════════════════════
+//  SVG PAN / ZOOM / DRAG
+// ════════════════════════════════════════════════════════
+function initSVGPan(){
+  const svg=document.getElementById('svg-canvas');
+  svg.addEventListener('mousedown',e=>{
+    if(draggingNode)return;
+    dragging=true;dragStart={x:e.clientX-vx,y:e.clientY-vy};svg.style.cursor='grabbing';
+  });
+  window.addEventListener('mousemove',e=>{
+    if(draggingNode){
+      const pt=svgPoint(e.clientX,e.clientY);
+      nodePos[draggingNode]={x:pt.x,y:pt.y};
+      const s=simSteps[simCur];drawTM(s?s.state:null,s?s.t:null);return;
+    }
+    if(!dragging)return;
+    vx=e.clientX-dragStart.x;vy=e.clientY-dragStart.y;setViewport();
+  });
+  window.addEventListener('mouseup',()=>{dragging=false;draggingNode=null;document.getElementById('svg-canvas').style.cursor='grab';});
+  svg.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const f=e.deltaY<0?1.12:0.89;
+    const rect=svg.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    vx=(vx-mx)*f+mx;vy=(vy-my)*f+my;vz*=f;setViewport();
+  });
+}
+function svgPoint(cx,cy){const svg=document.getElementById('svg-canvas'),rect=svg.getBoundingClientRect();return{x:(cx-rect.left-vx)/vz,y:(cy-rect.top-vy)/vz};}
+function setViewport(){document.getElementById('viewport').setAttribute('transform',`translate(${vx},${vy}) scale(${vz})`);}
+function zoomBy(f){const svg=document.getElementById('svg-canvas'),cx=svg.clientWidth/2,cy=svg.clientHeight/2;vx=(vx-cx)*f+cx;vy=(vy-cy)*f+cy;vz*=f;setViewport();}
+function fitView(){
+  if(!tm)return;
+  const svg=document.getElementById('svg-canvas'),W=svg.clientWidth,H=svg.clientHeight;
+  const pos=Object.values(nodePos);if(!pos.length)return;
+  const minX=Math.min(...pos.map(p=>p.x))-90,maxX=Math.max(...pos.map(p=>p.x))+90;
+  const minY=Math.min(...pos.map(p=>p.y))-80,maxY=Math.max(...pos.map(p=>p.y))+80;
+  const fw=maxX-minX,fh=maxY-minY,scale=Math.min(W/fw,H/fh,1.6)*0.85;
+  vz=scale;vx=W/2-(minX+fw/2)*scale;vy=H/2-(minY+fh/2)*scale;setViewport();
+}
+
+// ════════════════════════════════════════════════════════
+//  SIMULATION ENGINE
+// ════════════════════════════════════════════════════════
+function startSim(){
+  if(!tm){toast('Build a machine first','err');return;}
+  stopPlay();
+  const raw=document.getElementById('sim-input').value;
+  const inputStr=(raw===''||raw==='ε')?'':raw;
+
+  // Build initial tape from input
+  const initTape=new Map();
+  for(let i=0;i<inputStr.length;i++)initTape.set(i,inputStr[i]);
+
+  // Build δ lookup: "state|symbol" → transition
+  const transMap=new Map();
+  for(const t of tm.trans)transMap.set(t.from+'|'+t.read,t);
+
+  // Compute trace
+  const steps=[];
+  let state=tm.start,head=0,tape=new Map(initTape);
+  const MAX=Math.max(20,maxSteps);
+
+  // Prepend initial config (step 0)
+  steps.push({stepNum:0,state,headPos:head,tapeSnapshot:new Map(tape),
+    sym:tape.get(head)??tm.blank,t:null,action:'START',
+    accepted:false,dead:false,isHalt:false,rule:'Initial configuration',isInitial:true});
+
+  for(let stepNum=1;stepNum<=MAX;stepNum++){
+    const sym=tape.get(head)??tm.blank;
+    const isAcc=state===tm.accept;
+    const isRej=tm.reject&&state===tm.reject;
+    const t=(!isAcc&&!isRej)?transMap.get(state+'|'+sym):null;
+    const noTrans=!isAcc&&!isRej&&!t;
+    const isMax=!isAcc&&!isRej&&!noTrans&&stepNum>MAX;
+
+    let action,accepted,dead,isHalt;
+    if(isAcc)       {action='ACCEPT';   accepted=true; dead=false;isHalt=true;}
+    else if(isRej)  {action='REJECT';   accepted=false;dead=true; isHalt=true;}
+    else if(noTrans){action='REJECT';   accepted=false;dead=true; isHalt=true;}
+    else            {action='STEP';     accepted=false;dead=false;isHalt=false;}
+
+    const rule=isAcc?'Accept state reached — string accepted':
+               isRej?'Reject state reached — string rejected':
+               noTrans?`No transition δ(${state}, ${sym}) — implicit reject`:
+               t?`δ(${t.from}, ${t.read}) = (${t.to}, ${t.write}, ${t.dir})`:'';
+
+    steps.push({stepNum,state,headPos:head,tapeSnapshot:new Map(tape),
+      sym,t:(!isHalt?t:null),action,accepted,dead,isHalt,rule,isInitial:false});
+
+    if(isHalt)break;
+
+    // Fire transition
+    tape.set(head,t.write);
+    head+=(t.dir==='R'?1:-1);
+    state=t.to;
+
+    // Check if we've hit the step limit
+    if(stepNum>=MAX&&!isAcc&&!isRej){
+      const sym2=tape.get(head)??tm.blank;
+      steps.push({stepNum:stepNum+1,state,headPos:head,tapeSnapshot:new Map(tape),
+        sym:sym2,t:null,action:'MAX_STEPS',accepted:false,dead:true,isHalt:true,
+        rule:`Max ${MAX} steps exceeded — possible infinite loop`,isInitial:false});
+      break;
+    }
+  }
+
+  simSteps=steps;simCur=0;
+  renderTrace();applySimStep(0);enableSimBtns(true);
+  document.getElementById('btn-back').disabled=true;
+  setBar(`"${raw||'ε'}" — ${simSteps.length-1} transition(s) computed`);
+  document.getElementById('canvas-tape').classList.add('visible');
+  document.getElementById('config-display').style.display='';
+  document.getElementById('trace-sec').style.display='';
+  document.getElementById('result').innerHTML='';
+}
+
+// ════════════════════════════════════════════════════════
+//  APPLY STEP
+// ════════════════════════════════════════════════════════
+function applySimStep(i){
+  if(!simSteps.length)return;
+  i=Math.max(0,Math.min(simSteps.length-1,i));
+  simCur=i;
+  const s=simSteps[i];
+
+  // Redraw state diagram
+  drawTM(s.state,s.t);
+
+  // Highlight active state pill
+  document.querySelectorAll('.state-pill').forEach(el=>{
+    el.classList.toggle('sp-active',el.dataset.state===s.state);
+  });
+
+  // Config display
+  const cfgEl=document.getElementById('cfg-state');
+  cfgEl.textContent=s.state;cfgEl.style.color=getStateColor(s.state);
+  document.getElementById('cfg-head').textContent=s.headPos;
+  document.getElementById('cfg-sym').textContent=s.sym;
+  document.getElementById('cfg-step').textContent=`${i} / ${simSteps.length-1}`;
+
+  // Tape
+  renderFloatingTape(s.tapeSnapshot,s.headPos);
+
+  // Space-time update
+  if(viewMode==='spacetime')renderSpaceTime(i+1);
+
+  // Trace
+  addTraceLines(i);
+
+  // Status
+  if(!s.isInitial&&!s.isHalt)
+    setBar(`Step ${i}/${simSteps.length-1} — state: ${s.state} — reading: ${escH(s.sym)}`);
+
+  // Button states
+  document.getElementById('btn-back').disabled=(i<=0);
+  document.getElementById('btn-step').disabled=(i>=simSteps.length-1);
+
+  // Verdict
+  if(s.isHalt){
+    const raw=document.getElementById('sim-input').value||'ε';
+    const res=document.getElementById('result');
+    if(s.accepted){
+      res.innerHTML=`<div class="result-box res-accept">✓ ACCEPTED<div class="res-sub">"${escH(raw)}" is in the language</div></div>`;
+      setBadge('ok',`"${raw}" ACCEPTED`);
+    }else if(s.action==='MAX_STEPS'){
+      res.innerHTML=`<div class="result-box" style="background:rgba(245,158,11,.1);border:1px solid var(--yellow);color:var(--yellow)">⚠ MAX STEPS<div class="res-sub">Possible infinite loop — try increasing Max Steps</div></div>`;
+      setBadge('idle','Max steps exceeded');
+    }else{
+      res.innerHTML=`<div class="result-box res-reject">✗ REJECTED<div class="res-sub">"${escH(raw)}" is not in the language</div></div>`;
+      setBadge('err',`"${raw}" REJECTED`);
+    }
+    stopPlay();
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  SIMULATION CONTROLS
+// ════════════════════════════════════════════════════════
+function stepSim(){if(simCur===-1){startSim();return;}if(simCur<simSteps.length-1)applySimStep(simCur+1);}
+function stepBack(){if(simCur>0)applySimStep(simCur-1);}
+function runAll(){
+  if(isPlaying){stopPlay();return;}
+  if(simCur===-1||simCur>=simSteps.length-1){
+    startSim();if(!simSteps.length)return;
+  }
+  isPlaying=true;document.getElementById('btn-run').textContent='⏸ PAUSE';schedPlay();
+}
+function stopPlay(){isPlaying=false;clearTimeout(playTimer);document.getElementById('btn-run').textContent='▶ RUN';}
+function schedPlay(){
+  if(!isPlaying)return;
+  const delay=parseInt(document.getElementById('speed-slider').value)||420;
+  playTimer=setTimeout(()=>{if(simCur<simSteps.length-1){applySimStep(simCur+1);schedPlay();}else stopPlay();},delay);
+}
+function resetSim(){
+  stopPlay();simSteps=[];simCur=-1;
+  document.getElementById('result').innerHTML='';
+  renderTrace();
+  document.getElementById('canvas-tape').classList.remove('visible');
+  document.getElementById('config-display').style.display='none';
+  document.getElementById('cfg-state').textContent='—';document.getElementById('cfg-head').textContent='—';
+  document.getElementById('cfg-sym').textContent='—';document.getElementById('cfg-step').textContent='—';
+  if(tm)drawTM(null,null);
+  document.querySelectorAll('.state-pill').forEach(el=>el.classList.remove('sp-active'));
+  enableSimBtns(false);
+  if(tm){
+    document.getElementById('btn-step').disabled=false;
+    document.getElementById('btn-run').disabled=false;
+    setBar('"'+tm.name+'" — ready. Enter an input string and press STEP or RUN.');
+  }
+  clearSpaceTime();
+  if(viewMode==='spacetime')setViewMode('diagram');
+}
+function enableSimBtns(on){
+  ['btn-step','btn-run','btn-reset'].forEach(id=>document.getElementById(id).disabled=!on);
+  document.getElementById('btn-back').disabled=true;
+}
+
+// ════════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ════════════════════════════════════════════════════════
+function renderFloatingTape(tapeMap,headPos){
+  const el=document.getElementById('tape-cells');
+  if(!tm){el.innerHTML='';return;}
+  const WINDOW=17,half=Math.floor(WINDOW/2);
+  let html='';
+  for(let i=headPos-half;i<=headPos+half;i++){
+    const sym=tapeMap.get(i)??tm.blank;
+    const isHead=i===headPos;
+    const isWritten=tapeMap.has(i);
+    let cls='tape-cell';
+    if(isHead)cls+=' tape-head';
+    else if(isWritten&&sym!==tm.blank)cls+=' tape-written';
+    else cls+=' tape-blank';
+    html+=`<div class="${cls}">
+      <div class="tape-ptr">${isHead?'▼':''}</div>
+      <div class="tape-sym">${escH(sym)}</div>
+      <div class="tape-idx">${i}</div>
+    </div>`;
+  }
+  el.innerHTML=html;
+}
+
+function renderTrace(){
+  document.getElementById('trace').innerHTML=
+    '<div class="trace-line" style="font-style:italic;justify-content:center;color:var(--muted)">Press STEP or RUN to start…</div>';
+}
+
+function addTraceLines(stepIdx){
+  const el=document.getElementById('trace');
+  el.innerHTML='';
+  simSteps.slice(0,stepIdx+1).forEach(s=>{
+    if(s.isInitial)return;
+    const line=document.createElement('div');line.className='trace-line';
+    if(s.accepted){
+      line.innerHTML=`<span class="tl-accept">✓ ACCEPT</span><span class="tl-rule">${escH(s.rule)}</span>`;
+    }else if(s.dead){
+      const cls=s.action==='MAX_STEPS'?'tl-warn':'tl-reject';
+      line.innerHTML=`<span class="${cls}">${s.action==='MAX_STEPS'?'⚠ MAX':'✗ REJECT'}</span><span class="tl-rule"> ${escH(s.rule)}</span>`;
+    }else if(s.t){
+      line.innerHTML=
+        `<span class="tl-step">[${s.stepNum}]</span>`+
+        `<span class="tl-state">${escH(s.state)}</span>`+
+        `<span style="color:var(--muted)">r:</span><span class="tl-sym">${escH(s.sym)}</span>`+
+        `<span style="color:var(--muted)">→</span>`+
+        `<span style="color:var(--muted)">w:</span><span class="tl-write">${escH(s.t.write)}</span>`+
+        `<span class="tl-dir">${s.t.dir}</span>`+
+        `<span style="color:var(--muted)">→</span>`+
+        `<span class="tl-state">${escH(s.t.to)}</span>`;
+    }
+    el.appendChild(line);
+  });
+  el.scrollTop=el.scrollHeight;
+}
+
+// ════════════════════════════════════════════════════════
+//  SPACE-TIME DIAGRAM
+// ════════════════════════════════════════════════════════
+const ST_CW=26,ST_CH=20;
+
+function renderSpaceTime(upToStep){
+  const canvas=document.getElementById('st-canvas');
+  const ctx=canvas.getContext('2d');
+  const steps=simSteps.slice(0,upToStep||simSteps.length);
+  if(!steps.length){clearSpaceTime();return;}
+
+  // Find tape position range
+  let minPos=0,maxPos=0;
+  steps.forEach(s=>{
+    for(const[p] of s.tapeSnapshot){minPos=Math.min(minPos,p);maxPos=Math.max(maxPos,p);}
+    minPos=Math.min(minPos,s.headPos);maxPos=Math.max(maxPos,s.headPos);
+  });
+  minPos-=2;maxPos+=2;
+  const numCols=maxPos-minPos+1,numRows=steps.length;
+  canvas.width=numCols*ST_CW;canvas.height=numRows*ST_CH;
+
+  const dark=!document.documentElement.classList.contains('light');
+  ctx.fillStyle=dark?'#0a0f1a':'#f8fafc';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  steps.forEach((s,row)=>{
+    for(let p=minPos;p<=maxPos;p++){
+      const sym=s.tapeSnapshot.get(p)??tm?.blank;
+      const isHead=p===s.headPos,isWritten=s.tapeSnapshot.has(p);
+      const x=(p-minPos)*ST_CW,y=row*ST_CH;
+
+      // Cell background
+      if(isHead)ctx.fillStyle='rgba(245,158,11,.8)';
+      else if(isWritten&&sym!==tm?.blank)ctx.fillStyle='rgba(34,211,238,.45)';
+      else ctx.fillStyle=dark?'rgba(30,41,59,.65)':'rgba(226,232,240,.9)';
+      ctx.fillRect(x+1,y+1,ST_CW-2,ST_CH-2);
+
+      // Grid
+      ctx.strokeStyle=dark?'rgba(51,65,85,.35)':'rgba(203,213,225,.5)';
+      ctx.lineWidth=0.5;ctx.strokeRect(x,y,ST_CW,ST_CH);
+
+      // Symbol text
+      ctx.fillStyle=isHead?'#0f172a':(isWritten&&sym!==tm?.blank?'#083344':(dark?'#475569':'#94a3b8'));
+      ctx.font=`600 ${Math.min(10,ST_CH-5)}px JetBrains Mono`;
+      ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(sym??BLANK,x+ST_CW/2,y+ST_CH/2);
+    }
+  });
+
+  // Current step highlight
+  if(simCur>0&&simCur<steps.length){
+    ctx.strokeStyle='rgba(245,158,11,.7)';ctx.lineWidth=2;
+    ctx.strokeRect(0,simCur*ST_CH,canvas.width,ST_CH);
+  }
+}
+
+function clearSpaceTime(){
+  const canvas=document.getElementById('st-canvas');
+  const ctx=canvas.getContext('2d');
+  canvas.width=0;canvas.height=0;
+}
+
+// ════════════════════════════════════════════════════════
+//  VIEW MODE TOGGLE
+// ════════════════════════════════════════════════════════
+function setViewMode(mode){
+  viewMode=mode;
+  const dBtn=document.getElementById('btn-view-diag'),sBtn=document.getElementById('btn-view-st');
+  const svgEl=document.getElementById('svg-canvas'),stEl=document.getElementById('st-container');
+  const tape=document.getElementById('canvas-tape'),cfg=document.getElementById('config-display');
+  const fc=document.querySelector('.floating-controls');
+  if(mode==='diagram'){
+    dBtn.classList.add('active');sBtn.classList.remove('active');
+    svgEl.style.display='';stEl.style.display='none';
+    if(simSteps.length){tape.classList.add('visible');if(simCur>-1)cfg.style.display='';}
+    if(fc)fc.style.display='';
+  }else{
+    sBtn.classList.add('active');dBtn.classList.remove('active');
+    svgEl.style.display='none';stEl.style.display='block';
+    tape.classList.remove('visible');cfg.style.display='none';
+    if(fc)fc.style.display='none';
+    renderSpaceTime(simCur+1);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  SIDEBAR UPDATES
+// ════════════════════════════════════════════════════════
+function updateSidebarTM(){
+  if(!tm)return;
+
+  // Info card
+  const inputSyms=[...new Set(tm.tapeAlpha.filter(s=>s!==BLANK))];
+  document.getElementById('tm-card').innerHTML=
+    `<span>${escH(tm.name)}</span><br>`+
+    `<div style="margin-top:5px">States: {${tm.states.map(s=>escH(s)).join(', ')}}<br>`+
+    `Γ = {${tm.tapeAlpha.map(s=>escH(s)).join(', ')}}<br>`+
+    `Start: <span style="color:var(--accent)">${escH(tm.start)}</span>`+
+    (tm.accept?` &nbsp; Accept: <span style="color:var(--green)">${escH(tm.accept)}</span>`:'')+
+    (tm.reject?` &nbsp; Reject: <span style="color:var(--red)">${escH(tm.reject)}</span>`:'')+
+    `<br>${tm.trans.length} transition(s)</div>`;
+
+  // State pills
+  document.getElementById('state-pills').innerHTML=tm.states.map(s=>{
+    const col=getStateColor(s);
+    const b=[];
+    if(s===tm.start) b.push('<span class="sp-badge start">START</span>');
+    if(s===tm.accept)b.push('<span class="sp-badge accept">ACC</span>');
+    if(s===tm.reject)b.push('<span class="sp-badge reject">REJ</span>');
+    return`<div class="state-pill" data-state="${escH(s)}">
+      <div class="sp-dot" style="background:${col}"></div>
+      <div class="sp-name">${escH(s)}</div>
+      <div class="sp-badges">${b.join('')}</div>
+    </div>`;
+  }).join('');
+
+  // Quick test buttons from preset
+  const preset=TM_PRESETS.find(p=>p.id===activePreset);
+  const exs=preset?.ex||[];
+  document.getElementById('quick-btns').innerHTML=exs.slice(0,8).map(s=>
+    `<button onclick="testStr(${JSON.stringify(s)})"
+      style="font-family:var(--font-mono);font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;border:1px solid var(--border);color:var(--muted);background:transparent;cursor:pointer;transition:all .15s"
+      onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'"
+      onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--muted)'"
+      >${s===''?'ε (empty)':escH(s)}</button>`
+  ).join('');
+}
+
+function testStr(s){document.getElementById('sim-input').value=s;startSim();}
+
+function showSidebarSections(){
+  ['states-sec','sim-sec','trace-sec'].forEach(id=>document.getElementById(id).style.display='');
+}
+
+function clearTM(){
+  tm=null;simSteps=[];simCur=-1;
+  document.getElementById('tm-card').innerHTML='<em style="color:var(--muted)">No machine loaded.</em>';
+  document.getElementById('state-pills').innerHTML='';
+  ['states-sec','sim-sec','trace-sec'].forEach(id=>document.getElementById(id).style.display='none');
+  document.getElementById('io-row').style.display='none';
+  document.getElementById('view-toggle').style.display='none';
+  document.getElementById('viewport').innerHTML='';
+  document.getElementById('canvas-hint').style.display='';
+  document.getElementById('canvas-tape').classList.remove('visible');
+  document.getElementById('config-display').style.display='none';
+  document.getElementById('result').innerHTML='';
+  clearSpaceTime();
+  setBadge('idle','No machine loaded');
+  setBar('Create a Turing Machine to begin');
+}
+
+// ════════════════════════════════════════════════════════
+//  UI HELPERS
+// ════════════════════════════════════════════════════════
+function setBar(text,tag){
+  const el=document.getElementById('bar-text');let html='';
+  if(tag)html+=`<span class="canvas-tag">${escH(tag)}</span> `;
+  html+=escH(text);el.innerHTML=html;
+}
+function setBadge(type,text){
+  const dot=document.getElementById('badge-dot'),txt=document.getElementById('badge-txt');
+  dot.className='dot';
+  if(type==='ok')dot.classList.add('dot-green');
+  else if(type==='err')dot.classList.add('dot-red');
+  else dot.classList.add('dot-yellow');
+  txt.textContent=text;
+}
+function toast(msg,type){
+  const prev=document.getElementById('bar-text').innerHTML;
+  const icon=type==='ok'?'✓ ':type==='err'?'✗ ':'';
+  setBar(icon+msg);
+  setTimeout(()=>document.getElementById('bar-text').innerHTML=prev,1800);
+}
+function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function toggleTheme(){
+  const root=document.documentElement,isDark=!root.classList.contains('light');
+  root.classList.toggle('light',isDark);
+  document.getElementById('theme-icon').textContent=isDark?'🌙':'☀';
+  document.getElementById('theme-label').textContent=isDark?'Dark':'Light';
+  if(tm){const s=simSteps[simCur];drawTM(s?s.state:null,s?s.t:null);}
+}
+</script>
+</body>
+</html>

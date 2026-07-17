@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unified Automata Simulator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="logo">
+                <div class="logo-icon">Σ</div>
+                <h1>Automata Studio</h1>
+            </div>
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active" data-target="cfg_pda.html">
+                    <span class="icon">℘</span>
+                    <span class="text">CFG / PDA</span>
+                </a>
+                <a href="#" class="nav-item" data-target="dfa_nfa.html">
+                    <span class="icon">δ</span>
+                    <span class="text">DFA / NFA</span>
+                </a>
+                <a href="#" class="nav-item" data-target="turing_machine.html">
+                    <span class="icon">τ</span>
+                    <span class="text">Turing Machine</span>
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <p>Pro Edition</p>
+            </div>
+        </aside>
+        
+        <main class="main-content">
+            <header class="top-header">
+                <h2 id="current-sim-title">CFG / PDA Simulator</h2>
+                <div class="header-actions">
+                    <button class="btn btn-primary" id="btn-fullscreen">
+                        <span class="icon">⛶</span> Fullscreen
+                    </button>
+                </div>
+            </header>
+            <div class="iframe-container">
+                <iframe id="simulator-frame" src="cfg_pda.html" frameborder="0"></iframe>
+            </div>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
